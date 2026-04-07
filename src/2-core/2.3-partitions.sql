@@ -2,76 +2,112 @@
 
   * Star this project if it helped you! | Deixe uma estrela se te ajudou!
   * Contributions welcome! | Contribuições são bem-vindas!
-  
+
 ============================================================================================*/
 
--- PARTITION MANAGEMENT - AUTO MANAGE PARTITIONS
--- 
+-- PARTITION MANAGEMENT - PG_PARTMAN
+--
 -- This file contains:
--- - Function to automatically create monthly partitions
--- - Handles current and future months based on parameter
--- - Optimizes partitions for write-heavy audit logs (fillfactor=100)
--- - Prevents gaps in partition coverage
-
--- Automatically creates monthly partitions for audit.logging_dml
--- Parameter: p_months_ahead = number of future months to pre-create (default: 1)
-CREATE OR REPLACE FUNCTION audit.auto_manage_partitions(p_months_ahead INT DEFAULT 1)
-RETURNS text LANGUAGE plpgsql AS $function$
-DECLARE
-    v_date_target DATE;
-    v_start_date  DATE;
-    v_end_date    DATE;
-    v_table_name  TEXT;
-    v_sql         TEXT;
-    i             INT;
-BEGIN
-/*===========================================================================
-  
-    * Project: postgres-audit-log
-    * Repository: https://github.com/richwrd/postgres-audit-log
-    * Author: richwrd (Eduardo Richard)
-    * Star this project if it helped you! 
-  
-=============================================================================*/
-
-    /* Parameter p_months_ahead:
-       0 = Current month only
-       1 = Current month + Next month (Default)
-       12 = Current month + Next 12 months
-    */
-
-    FOR i IN 0..p_months_ahead LOOP
-        v_date_target := DATE_TRUNC('MONTH', CURRENT_DATE) + (i || ' month')::INTERVAL;
-        v_start_date  := v_date_target;
-        v_end_date    := v_start_date + INTERVAL '1 month';
-        
-        v_table_name := 'logging_dml_y' || TO_CHAR(v_start_date, 'YYYY') || 'm' || TO_CHAR(v_start_date, 'MM');
-
-        IF TO_REGCLASS('audit.' || v_table_name) IS NULL THEN
-            v_sql := format('CREATE TABLE IF NOT EXISTS audit.%I PARTITION OF audit.logging_dml FOR VALUES FROM (%L) TO (%L)', 
-                            v_table_name, v_start_date, v_end_date);
-            EXECUTE v_sql;
-            
-            -- Optimization: Logs are Write-Once (Append Only), fillfactor 100 saves ~10-15% disk space
-            EXECUTE format('ALTER TABLE audit.%I SET (fillfactor = 100)', v_table_name);
-            
-            RAISE NOTICE '[OK] Partition Created: audit.% (Range: % to %)', v_table_name, v_start_date, v_end_date;
-        ELSE
-            RAISE NOTICE '[OK] Partition already exists: audit.%', v_table_name;
-        END IF;
-    END LOOP;
-
-    RETURN 'Partition verification completed for ' || (p_months_ahead + 1) || ' months.';
-END;
-$function$;
-
-COMMENT ON FUNCTION audit.auto_manage_partitions(INT) IS 'Automatically creates and manages monthly partitions for audit.logging_dml';
+-- - Registration of audit.logging_dml into pg_partman
+-- - All partition settings consolidated in partman.part_config
+-- - Automatic monthly partition creation and retention policy
+--
+-- REQUIREMENTS:
+--   pg_partman extension must be installed:
+--     CREATE EXTENSION IF NOT EXISTS pg_partman SCHEMA partman;
+--
+-- MAINTENANCE:
+--   Run periodically (e.g. via pg_cron or cron job):
+--     SELECT partman.run_maintenance();
+--
+-- REFERENCE:
+--   https://github.com/pgpartman/pg_partman
 
 --============================================================================================
--- EXECUTION EXAMPLES
+-- EXTENSION
 
--- 1. Default usage (Ensures current and next month) - Ideal for monthly Cron Jobs
--- SELECT audit.auto_manage_partitions();
+CREATE EXTENSION IF NOT EXISTS pg_partman SCHEMA partman;
 
--- 2. Manual usage (Ensures entire semester) - Ideal for initial deployment
--- SELECT audit.auto_manage_partitions(36);
+--============================================================================================
+-- REGISTER TABLE WITH PG_PARTMAN
+--
+-- partman.create_parent() bootstraps the partitioning:
+--   p_parent_table   : fully qualified parent table
+--   p_control        : partition key column
+--   p_interval       : partition interval ('monthly', 'daily', etc.)
+--   p_start_partition: first child partition boundary (ISO 8601 date string)
+--   p_premake        : number of future partitions to pre-create (default 4)
+--
+-- After this call, ALL configuration lives in partman.part_config.
+
+SELECT partman.create_parent(
+    p_parent_table   => 'audit.logging_dml',
+    p_control        => 'created_at',
+    p_interval       => 'monthly',
+    p_start_partition => DATE_TRUNC('month', CURRENT_DATE)::TEXT
+);
+
+--============================================================================================
+-- CENTRALIZED CONFIGURATION IN partman.part_config
+--
+-- Adjust settings to match the audit log workload.
+-- These are the only values you need to change to tune partition behaviour.
+
+UPDATE partman.part_config
+SET
+
+    -- Pre-create N months ahead (keeps queries from ever hitting a "no partition" error)
+    premake                   = 3,
+
+    -- Automatically detect and create missing child partitions on each maintenance run
+    automatic_maintenance     = 'on',
+
+    -- Retention: keep 12 months of data online; older partitions are DROPPED automatically.
+    -- Set to NULL to disable automatic drop.
+    retention                 = '12 months',
+
+    -- When a partition exceeds retention, DROP it (set to FALSE to keep it but detach it)
+    retention_keep_table      = FALSE,
+
+    -- Keep the indexes on retained tables (irrelevant when retention_keep_table = FALSE)
+    retention_keep_index      = FALSE,
+
+    -- Inherit table privileges from the parent to every new child partition
+    inherit_privileges        = TRUE
+
+WHERE parent_table = 'audit.logging_dml';
+
+--============================================================================================
+-- CONFIGURE FILLFACTOR ON EXISTING CHILD PARTITIONS
+--
+-- Audit logs are append-only (write-once), so fillfactor=100 eliminates the free-space
+-- reservation PostgreSQL normally keeps for future updates, saving ~10-15% disk space.
+--
+-- pg_partman inherits this automatically from the parent's storage parameters, so we
+-- only need to set it once on the parent table.
+
+ALTER TABLE audit.logging_dml SET (fillfactor = 100);
+
+--============================================================================================
+-- INITIAL MAINTENANCE RUN
+--
+-- Triggers pg_partman to immediately create the bootstrap partitions defined by
+-- p_start_partition and premake, instead of waiting for the next scheduled run.
+
+SELECT partman.run_maintenance('audit.logging_dml');
+
+--============================================================================================
+-- EXECUTION EXAMPLES (for reference / manual use)
+
+-- Run maintenance for ALL pg_partman-managed tables:
+-- SELECT partman.run_maintenance();
+
+-- Run maintenance for this table only:
+-- SELECT partman.run_maintenance('audit.logging_dml');
+
+-- Inspect current partition configuration:
+-- SELECT * FROM partman.part_config WHERE parent_table = 'audit.logging_dml';
+
+-- List all child partitions managed by pg_partman:
+-- SELECT child_schema, child_tablename, partition_range
+-- FROM partman.show_partitions('audit.logging_dml');
